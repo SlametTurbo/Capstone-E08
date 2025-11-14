@@ -1,1 +1,26 @@
 # Capstone-E08
+
+Pinouts :
+
+#  USART 2 - debugging message
+PA3 -> USART2_RX
+PA2 -> USART3_TX
+
+# LoRa - SPI1
+PA5 -> SPI1_SCK
+PA6 -> SPI1_MISO
+PA7 -> SPI1_MOSI
+PB0 -> NSS
+PB1 -> RST
+PB2 -> DIO0
+
+# GPS - USART 1
+PA10 - USART1_RX
+PA9  - USART1_TX
+
+#  MPU6050 & BMP180 & SHT30 - I2C1
+PB7  ->  I2C1_SDA
+PB6  ->  I2C1_SCL
+
+#  DS18B20  -  Onewire
+PB9
