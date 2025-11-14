@@ -34,6 +34,9 @@
 #include "LoRa.h"
 #include "Math.h"
 #include "ds18b20.h"
+#include "sht3x.h"
+#include "bmp180_for_stm32_hal.h"
+#include "ow.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,7 +46,24 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define  A3F    208     // 208 Hz
+#define  B3F    233     // 233 Hz
+#define  B3     247     // 247 Hz
+#define  C4     261     // 261 Hz (middle C)
+#define  C4S    277     // 277 Hz
+#define  E4F    311     // 311 Hz
+#define  F4     349     // 349 Hz
+#define  A4F    415     // 415 Hz
+#define  B4F    466     // 466 Hz
+#define  B4     493     // 493 Hz
+#define  C5     523     // 523 Hz
+#define  C5S    554     // 554 Hz
+#define  E5F    622     // 622 Hz
+#define  F5     698     // 698 Hz
+#define  F5S    740     // 740 Hz
+#define  A5F    831     // 831 Hz
 
+#define  REST   (-1)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -55,14 +75,15 @@
 /* USER CODE BEGIN PV */
 LoRa myLoRa;
 ds18b20_t ds18;
+GPSSTRUCT gpsData;
+sht3x_handle_t sht3x;
 
-char msg[] = "Transmit Success!\r\n";
-char msg0[] = "Transmit Failed!\r\n";
+char msg[] = "\r\nTransmit Success!\r\n";
+char msg0[] = "\r\nTransmit Failed!\r\n";
 
 char GGA[100];
 char RMC[100];
 
-GPSSTRUCT gpsData;
 
 uint32_t t_mpu = 0;
 uint32_t t_gps = 0;
@@ -76,10 +97,33 @@ char Buffer [160];
 int VCCTimeout = 5000; // GGA or RMC will not be received if the VCC is not sufficient
 
 float tempDUM = 0;
-float humiDUM = 91.02;
+float humiDUM = 0;
 float presDUM = 1008.0;
 int	  piezDUM = 0;
 int   stampDUM = 0;
+
+
+/* Tempo & jeda antar nada (mengikuti Arduino) */
+static const uint16_t RICK_BEAT_LEN_MS = 100;
+static const float    RICK_SEP_CONST   = 0.3f;
+
+/* ===== Chorus ===== */
+static const int16_t song1_chorus_melody[] =
+{
+    B4F, B4F, A4F, A4F,
+    F5, F5, E5F, B4F, B4F, A4F, A4F, E5F, E5F, C5S, C5, B4F,
+    C5S, C5S, C5S, C5S,
+    C5S, E5F, C5, B4F, A4F, A4F, A4F, E5F, C5S,
+};
+
+static const uint8_t song1_chorus_rhythm[] =
+{
+    1, 1, 1, 1,
+    3, 3, 6, 1, 1, 1, 1, 3, 3, 3, 1, 2,
+    1, 1, 1, 1,
+    3, 3, 3, 1, 2, 2, 2, 4, 8,
+};
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -90,6 +134,9 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+
+/*	######## Settingan Temperatur	###########*/
 float DS18_ReadTemperature(ds18b20_t *dev)
 {
     // Mulai konversi
@@ -104,8 +151,13 @@ float DS18_ReadTemperature(ds18b20_t *dev)
     // Ambil hasil
     int16_t raw = ds18b20_read_c(dev);     // °C x 100
 
-//    if (raw == DS18B20_ERROR)
-//        return -1000.0f;  // Return error
+
+    if (raw == DS18B20_ERROR)
+    {
+        printf("DS18 read error, last_err=%d\r\n",
+               (int)ds18b20_last_error(dev));
+        return -1000.0f;
+    }
 
     return raw / 100.0f;  // konversi ke float Celsius
 }
@@ -114,6 +166,143 @@ void ds18_tim_cb(TIM_HandleTypeDef *htim)
 {
     ow_callback(&ds18.ow);
 }
+
+
+
+/* ===== Definisi nada & array Rickroll sama seperti punyamu ===== */
+
+/* Helper untuk hitung jumlah elemen array */
+#define ARR_SIZE(x)  (sizeof(x) / sizeof((x)[0]))
+
+/* 1. LETAKKAN FUNGSI-FUNGSI DASAR BUZZER DI ATAS */
+static void Buzzer_SetDuty(uint8_t duty_percent)
+{
+    if (duty_percent > 100) duty_percent = 100;
+
+    uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim1);
+    uint32_t cmp = (arr + 1) * duty_percent / 100;
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, cmp);
+}
+
+static void Buzzer_SetFreq(uint32_t freq_hz)
+{
+    if (freq_hz == 0) {
+        Buzzer_SetDuty(0);
+        return;
+    }
+
+    // Asumsi: TIM1 tick = 1 MHz (PSC diset di CubeMX)
+    uint32_t tim_tick_hz = 1000000U;
+    uint32_t arr = (tim_tick_hz / freq_hz) - 1;
+
+    __HAL_TIM_SET_AUTORELOAD(&htim1, arr);
+
+    uint32_t cmp = (arr + 1) / 2;
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, cmp);
+}
+
+static void Buzzer_Init(void)
+{
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+    Buzzer_SetDuty(0);
+}
+
+static void Buzzer_PlayTone(uint16_t freq_hz, uint16_t dur_ms)
+{
+    if (freq_hz == 0) {
+        Buzzer_SetDuty(0);
+        HAL_Delay(dur_ms);
+        return;
+    }
+
+    Buzzer_SetFreq(freq_hz);
+    Buzzer_SetDuty(50);
+    HAL_Delay(dur_ms);
+    Buzzer_SetDuty(0);
+    HAL_Delay(20);
+}
+
+static void Buzzer_Beep_OK(void)
+{
+    Buzzer_PlayTone(2000, 80);
+}
+
+static void Buzzer_Beep_ERR(void)
+{
+    Buzzer_PlayTone(500, 1000);
+}
+
+static void Buzzer_PlayMeme_PleaseSpeed(void)
+{
+    // Tone seperti meme "please speed I need this"
+    // Serangkaian beep cepat dengan pitch naik-turun
+
+    const uint16_t notes[] = {
+        900, 1200, 1000, 1500, 800,
+        1400, 1600, 1800, 1300, 2000
+    };
+
+    const uint16_t durations[] = {
+        80, 70, 60, 70, 50,
+        60, 60, 70, 50, 120
+    };
+
+    uint8_t count = sizeof(notes)/sizeof(notes[0]);
+
+    for (uint8_t i = 0; i < count; i++)
+    {
+        Buzzer_PlayTone(notes[i], durations[i]);
+    }
+
+    // Final "panic" trill
+    for (int i = 0; i < 6; i++)
+    {
+        Buzzer_PlayTone(2000 + (i * 200), 40);
+    }
+
+    // Tutup dengan beep panjang
+    Buzzer_PlayTone(800, 200);
+}
+
+
+static void Buzzer_PlayToneRick(int16_t freq_hz, uint16_t dur_ms, float sep)
+{
+    uint32_t sep_ms = (uint32_t)(dur_ms * sep);
+
+    if (freq_hz > 0) {
+        Buzzer_SetFreq((uint32_t)freq_hz);
+        Buzzer_SetDuty(50);
+        HAL_Delay(dur_ms);
+        Buzzer_SetDuty(0);
+    } else {
+        Buzzer_SetDuty(0);
+        HAL_Delay(dur_ms);
+    }
+
+    HAL_Delay(sep_ms);
+}
+
+static void Buzzer_PlayRickroll_Full(void)
+{
+    uint32_t n;
+    uint16_t len;
+
+    // Chorus
+    n = ARR_SIZE(song1_chorus_melody);
+    for (uint32_t i = 0; i < n; i++) {
+        len = RICK_BEAT_LEN_MS * song1_chorus_rhythm[i];
+        Buzzer_PlayToneRick(song1_chorus_melody[i], len, RICK_SEP_CONST);
+    }
+}
+
+
+
+
+
+
+
+
+
 
 /* USER CODE END 0 */
 
@@ -184,30 +373,52 @@ int main(void)
   MPU6050_Calibrate(&MPU6050, 1500, 2);
   MPU6050_InitAnglesFromAccel(&MPU6050);
 
-  ow_init_t ow_init_struct;
-  ow_init_struct.tim_handle = &htim3;
-  ow_init_struct.gpio = GPIOA;
-  ow_init_struct.pin = GPIO_PIN_4;
-  ow_init_struct.tim_cb = ds18_tim_cb;
-  ow_init_struct.done_cb = NULL;   // Optional
-  ow_init_struct.rom_id_filter = 0;
+  sht3x.i2c_handle = &hi2c1;
+  // Jika pin ADDR ke GND:
+  sht3x.device_address = SHT3X_I2C_DEVICE_ADDRESS_ADDR_PIN_LOW;
+  // Kalau ADDR ke VCC ganti ke *_ADDR_PIN_HIGH
 
-  ds18b20_init(&ds18, &ow_init_struct);
+  if (!sht3x_init(&sht3x)) {
+      printf("SHT3x access failed.\r\n");
+  } else {
+      printf("SHT3x init OK.\r\n");
+  }
 
+  // ==== Init BMP180 (GY-87) ====
+  BMP180_Init(&hi2c1);                          // pakai I2C1 yang sama dengan MPU6050
+  BMP180_SetOversampling(BMP180_STANDARD);      // mode oversampling standar
+  BMP180_UpdateCalibrationData();               // WAJIB: baca data kalibrasi dari EEPROM sensor
+  // ==============================
 
-  // Update ROM IDs for all devices
-  ds18b20_update_rom_id(&ds18);
-  while(ds18b20_is_busy(&ds18));
+  //	Onewire sama ds18b20
 
-  // Configure alarm thresholds and resolution
-  ds18b20_config_t ds18_conf = {
-      .alarm_high = 50,
-      .alarm_low = -50,
-      .cnv_bit = DS18B20_CNV_BIT_12
-  };
-  ds18b20_conf(&ds18, &ds18_conf);
-  while(ds18b20_is_busy(&ds18));
+    ow_init_t ow_init_struct;
+    ow_init_struct.tim_handle = &htim3;
+    ow_init_struct.gpio = GPIOB;
+    ow_init_struct.pin = GPIO_PIN_8;
+    ow_init_struct.tim_cb = ds18_tim_cb;
+    ow_init_struct.done_cb = NULL;
+    ow_init_struct.rom_id_filter = 0;
 
+    ds18b20_init(&ds18, &ow_init_struct);
+
+    // Update ROM IDs for all devices
+    ds18b20_update_rom_id(&ds18);
+    while(ds18b20_is_busy(&ds18));
+
+    // Configure alarm thresholds and resolution
+    ds18b20_config_t ds18_conf = {
+        .alarm_high = 50,
+        .alarm_low = -50,
+        .cnv_bit = DS18B20_CNV_BIT_12
+    };
+    ds18b20_conf(&ds18, &ds18_conf);
+    while(ds18b20_is_busy(&ds18));
+
+  Buzzer_Init();              // start PWM TIM1 CH1
+  Buzzer_PlayMeme_PleaseSpeed();
+//  Buzzer_PlayHappyBirthday(); // putar melody di startup
+//  Buzzer_PlayMeme_PleaseSpeed();
   HAL_Delay (500);
 
   /* USER CODE END 2 */
@@ -225,7 +436,22 @@ int main(void)
 
 	  if(now - t_temp >= 100){
 		  tempDUM = DS18_ReadTemperature(&ds18);	// Read dan update temperature (udah /100)
-		  t_temp = now;
+
+          // Baca suhu + kelembaban dari SHT3x
+          float t, h;
+          sht3x_read_temperature_and_humidity(&sht3x, &t, &h);
+
+          // Pakai hasil SHT3x untuk payload
+          humiDUM = h;
+//          tempDUM = t;
+
+          // Tekanan dari BMP180 (GY-87)
+          int32_t bmpPresPa = BMP180_GetPressure();   // satuan Pa
+          presDUM = bmpPresPa / 100.0f;               // konversi ke hPa (mbar)
+
+          t_temp = now;
+
+
 	  }
 
 	  /* GPS Parser (JANGAN diotak atik) */
@@ -246,7 +472,7 @@ int main(void)
 		  t_vcc = now;
 	  }
 
-	  if(now - t_lora >= 500){ // Transmit tiap 500ms
+	  if(now - t_lora >= 100){ // Transmit tiap 500ms
 		  snprintf(Buffer, sizeof(Buffer),
 				  "%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.10f,%.10f,%.2f,%d,%.2f,%.2f,%d",
 		  	  	  // Temp, Humi, pres  accx	 accy  accz  gyrx  gyry  gyrz  pitc  roll  head  LATI	LONG   ALTI  SATC  HDOP  SPD PIEZ
@@ -262,7 +488,7 @@ int main(void)
 				  MPU6050.gyro_z_f,
 				  MPU6050.pitch_deg,
 				  MPU6050.roll_deg,
-				  gpsData.rmcstruct.course,
+				  MPU6050.yaw_deg,
 				  gpsData.ggastruct.lcation.latitude,
 				  gpsData.ggastruct.lcation.longitude,
 				  gpsData.ggastruct.alt.altitude,
@@ -277,9 +503,11 @@ int main(void)
 
 		  if(status == 1){
 			  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+			  Buzzer_Beep_OK();
 		  }
 		  else{
 			  HAL_UART_Transmit(&huart2, (uint8_t*)msg0, strlen(msg0), 100);
+			  Buzzer_Beep_ERR();
 		  }
 		  stampDUM++;
 		  if(stampDUM > 9999) stampDUM = 0;
@@ -341,6 +569,15 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    // Timer yang dipakai untuk OneWire = TIM3
+    if (htim->Instance == TIM3)
+    {
+        ds18_tim_cb(htim);   // ini akan memanggil ow_callback(&ds18.ow);
+    }
+}
+
 int _write(int file, char *ptr, int len) {
     HAL_UART_Transmit(&huart2, (uint8_t*)ptr, len, HAL_MAX_DELAY);
     return len;
