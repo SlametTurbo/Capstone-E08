@@ -42,28 +42,17 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef enum {
+    DS_STATE_IDLE = 0,
+    DS_STATE_CONVERTING,
+    DS_STATE_READING
+} DS18_State_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define  A3F    208     // 208 Hz
-#define  B3F    233     // 233 Hz
-#define  B3     247     // 247 Hz
-#define  C4     261     // 261 Hz (middle C)
-#define  C4S    277     // 277 Hz
-#define  E4F    311     // 311 Hz
-#define  F4     349     // 349 Hz
-#define  A4F    415     // 415 Hz
-#define  B4F    466     // 466 Hz
-#define  B4     493     // 493 Hz
-#define  C5     523     // 523 Hz
-#define  C5S    554     // 554 Hz
-#define  E5F    622     // 622 Hz
-#define  F5     698     // 698 Hz
-#define  F5S    740     // 740 Hz
-#define  A5F    831     // 831 Hz
-
-#define  REST   (-1)
+#define RC_THRESHOLD_US   1500
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -102,27 +91,15 @@ float presDUM = 1008.0;
 int	  piezDUM = 0;
 int   stampDUM = 0;
 
+static DS18_State_t ds_state      = DS_STATE_IDLE;
+static float        ds_temp_last  = 0.0f;
+static uint8_t      ds_temp_ready = 0;   // if 1, data ready
 
-/* Tempo & jeda antar nada (mengikuti Arduino) */
-static const uint16_t RICK_BEAT_LEN_MS = 100;
-static const float    RICK_SEP_CONST   = 0.3f;
-
-/* ===== Chorus ===== */
-static const int16_t song1_chorus_melody[] =
-{
-    B4F, B4F, A4F, A4F,
-    F5, F5, E5F, B4F, B4F, A4F, A4F, E5F, E5F, C5S, C5, B4F,
-    C5S, C5S, C5S, C5S,
-    C5S, E5F, C5, B4F, A4F, A4F, A4F, E5F, C5S,
-};
-
-static const uint8_t song1_chorus_rhythm[] =
-{
-    1, 1, 1, 1,
-    3, 3, 6, 1, 1, 1, 1, 3, 3, 3, 1, 2,
-    1, 1, 1, 1,
-    3, 3, 3, 1, 2, 2, 2, 4, 8,
-};
+/* ==== RC receiver capture variables ==== */
+volatile uint32_t rc_ic_val1      = 0;
+volatile uint32_t rc_ic_val2      = 0;
+volatile uint32_t rc_pulse_width  = 0;   // dalam microsecond (kalau timer 1MHz)
+volatile uint8_t  rc_first_capture = 0;
 
 /* USER CODE END PV */
 
@@ -135,46 +112,60 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-
-/*	######## Settingan Temperatur	###########*/
-float DS18_ReadTemperature(ds18b20_t *dev)
+static void DS18_Task(void)
 {
-    // Mulai konversi
-    ds18b20_cnv(dev);
-    while (ds18b20_is_busy(dev));          // tunggu bus
-    while (!ds18b20_is_cnv_done(dev));     // tunggu selesai konversi
-
-    // Minta data scratchpad
-    ds18b20_req_read(dev, 0);
-    while (ds18b20_is_busy(dev));
-
-    // Ambil hasil
-    int16_t raw = ds18b20_read_c(dev);     // °C x 100
-
-
-    if (raw == DS18B20_ERROR)
+    switch (ds_state)
     {
-        printf("DS18 read error, last_err=%d\r\n",
-               (int)ds18b20_last_error(dev));
-        return -1000.0f;
-    }
+    case DS_STATE_IDLE:
 
-    return raw / 100.0f;  // konversi ke float Celsius
+        if (!ds18b20_is_busy(&ds18)) {
+            ow_err_t err = ds18b20_cnv(&ds18);
+            if (err == OW_ERR_NONE) {
+                ds_state = DS_STATE_CONVERTING;
+            } else {
+                // optional: error message
+            }
+        }
+        break;
+
+    case DS_STATE_CONVERTING:
+        // tunggu sampai konversi selesai (pakai timer internal lib)
+        if (ds18b20_is_cnv_done(&ds18) && !ds18b20_is_busy(&ds18)) {
+            ow_err_t err = ds18b20_req_read(&ds18, 0);
+            if (err == OW_ERR_NONE) {
+                ds_state = DS_STATE_READING;
+            } else {
+                ds_state = DS_STATE_IDLE;
+            }
+        }
+        break;
+
+    case DS_STATE_READING:
+
+        if (!ds18b20_is_busy(&ds18)) {
+            int16_t raw = ds18b20_read_c(&ds18);   //
+
+            if (raw != DS18B20_ERROR) {
+                ds_temp_last  = raw / 100.0f;
+                ds_temp_ready = 1;
+            } else {
+                ds_temp_ready = 0;
+            }
+
+            ds_state = DS_STATE_IDLE;
+        }
+        break;
+    }
 }
+
 
 void ds18_tim_cb(TIM_HandleTypeDef *htim)
 {
     ow_callback(&ds18.ow);
 }
 
-
-
-/* ===== Definisi nada & array Rickroll sama seperti punyamu ===== */
-
-/* Helper untuk hitung jumlah elemen array */
 #define ARR_SIZE(x)  (sizeof(x) / sizeof((x)[0]))
 
-/* 1. LETAKKAN FUNGSI-FUNGSI DASAR BUZZER DI ATAS */
 static void Buzzer_SetDuty(uint8_t duty_percent)
 {
     if (duty_percent > 100) duty_percent = 100;
@@ -191,7 +182,6 @@ static void Buzzer_SetFreq(uint32_t freq_hz)
         return;
     }
 
-    // Asumsi: TIM1 tick = 1 MHz (PSC diset di CubeMX)
     uint32_t tim_tick_hz = 1000000U;
     uint32_t arr = (tim_tick_hz / freq_hz) - 1;
 
@@ -224,7 +214,7 @@ static void Buzzer_PlayTone(uint16_t freq_hz, uint16_t dur_ms)
 
 static void Buzzer_Beep_OK(void)
 {
-    Buzzer_PlayTone(2000, 80);
+    Buzzer_PlayTone(2000, 5);
 }
 
 static void Buzzer_Beep_ERR(void)
@@ -232,10 +222,8 @@ static void Buzzer_Beep_ERR(void)
     Buzzer_PlayTone(500, 1000);
 }
 
-static void Buzzer_PlayMeme_PleaseSpeed(void)
+static void buzzerPlayStartup(void)
 {
-    // Tone seperti meme "please speed I need this"
-    // Serangkaian beep cepat dengan pitch naik-turun
 
     const uint16_t notes[] = {
         900, 1200, 1000, 1500, 800,
@@ -254,54 +242,12 @@ static void Buzzer_PlayMeme_PleaseSpeed(void)
         Buzzer_PlayTone(notes[i], durations[i]);
     }
 
-    // Final "panic" trill
     for (int i = 0; i < 6; i++)
     {
         Buzzer_PlayTone(2000 + (i * 200), 40);
     }
-
-    // Tutup dengan beep panjang
     Buzzer_PlayTone(800, 200);
 }
-
-
-static void Buzzer_PlayToneRick(int16_t freq_hz, uint16_t dur_ms, float sep)
-{
-    uint32_t sep_ms = (uint32_t)(dur_ms * sep);
-
-    if (freq_hz > 0) {
-        Buzzer_SetFreq((uint32_t)freq_hz);
-        Buzzer_SetDuty(50);
-        HAL_Delay(dur_ms);
-        Buzzer_SetDuty(0);
-    } else {
-        Buzzer_SetDuty(0);
-        HAL_Delay(dur_ms);
-    }
-
-    HAL_Delay(sep_ms);
-}
-
-static void Buzzer_PlayRickroll_Full(void)
-{
-    uint32_t n;
-    uint16_t len;
-
-    // Chorus
-    n = ARR_SIZE(song1_chorus_melody);
-    for (uint32_t i = 0; i < n; i++) {
-        len = RICK_BEAT_LEN_MS * song1_chorus_rhythm[i];
-        Buzzer_PlayToneRick(song1_chorus_melody[i], len, RICK_SEP_CONST);
-    }
-}
-
-
-
-
-
-
-
-
 
 
 /* USER CODE END 0 */
@@ -341,9 +287,12 @@ int main(void)
   MX_SPI1_Init();
   MX_TIM3_Init();
   MX_TIM1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
   uint32_t t_vcc  = HAL_GetTick();
+
+  HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
 
   myLoRa = newLoRa();
   myLoRa.hSPIx      = &hspi1;
@@ -374,9 +323,9 @@ int main(void)
   MPU6050_InitAnglesFromAccel(&MPU6050);
 
   sht3x.i2c_handle = &hi2c1;
+
   // Jika pin ADDR ke GND:
-  sht3x.device_address = SHT3X_I2C_DEVICE_ADDRESS_ADDR_PIN_LOW;
-  // Kalau ADDR ke VCC ganti ke *_ADDR_PIN_HIGH
+  sht3x.device_address = SHT3X_I2C_DEVICE_ADDRESS_ADDR_PIN_LOW;	  // Kalau ADDR ke VCC ganti ke *_ADDR_PIN_HIGH
 
   if (!sht3x_init(&sht3x)) {
       printf("SHT3x access failed.\r\n");
@@ -415,10 +364,8 @@ int main(void)
     ds18b20_conf(&ds18, &ds18_conf);
     while(ds18b20_is_busy(&ds18));
 
-  Buzzer_Init();              // start PWM TIM1 CH1
-  Buzzer_PlayMeme_PleaseSpeed();
-//  Buzzer_PlayHappyBirthday(); // putar melody di startup
-//  Buzzer_PlayMeme_PleaseSpeed();
+  Buzzer_Init();
+  buzzerPlayStartup();
   HAL_Delay (500);
 
   /* USER CODE END 2 */
@@ -429,28 +376,34 @@ int main(void)
   {
 	  uint32_t now = HAL_GetTick(); // Tick Scheduling ea
 
+	  DS18_Task();
+
 	  if(now - t_mpu >= 20){
-		  MPU6050_Update(&MPU6050); // Update MPU tiap 20ms || Overkill?
+		  MPU6050_Update(&MPU6050); // Update MPU tiap 20ms
 		  t_mpu = now;
 	  }
 
-	  if(now - t_temp >= 100){
-		  tempDUM = DS18_ReadTemperature(&ds18);	// Read dan update temperature (udah /100)
+
+	  if(now - t_temp >= 1000){
+
+		    if (ds_temp_ready) {
+		        tempDUM = ds_temp_last;     // pakai nilai DS18 terbaru
+		    }
 
           // Baca suhu + kelembaban dari SHT3x
           float t, h;
-          sht3x_read_temperature_and_humidity(&sht3x, &t, &h);
+          sht3x_read_temperature_and_humidity(&sht3x, &t, &h); // Ngeblokir kah ini
+
+          // Troubleshooting tips : BMP180_DELAY_TEMP kemaren dari 5 diganti jadi 1
 
           // Pakai hasil SHT3x untuk payload
           humiDUM = h;
-//          tempDUM = t;
 
           // Tekanan dari BMP180 (GY-87)
           int32_t bmpPresPa = BMP180_GetPressure();   // satuan Pa
           presDUM = bmpPresPa / 100.0f;               // konversi ke hPa (mbar)
 
           t_temp = now;
-
 
 	  }
 
@@ -472,10 +425,11 @@ int main(void)
 		  t_vcc = now;
 	  }
 
-	  if(now - t_lora >= 100){ // Transmit tiap 500ms
+	  if(now - t_lora >= 100){ // Transmit tiap 100ms
+
 		  snprintf(Buffer, sizeof(Buffer),
-				  "%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.10f,%.10f,%.2f,%d,%.2f,%.2f,%d",
-		  	  	  // Temp, Humi, pres  accx	 accy  accz  gyrx  gyry  gyrz  pitc  roll  head  LATI	LONG   ALTI  SATC  HDOP  SPD PIEZ
+				  "%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.10f,%.10f,%.2f,%d,%.2f,%.2f,%lu",
+		  	  	  // Temp, Humi, pres  accx	 accy  accz  gyrx  gyry  gyrz  pitc  roll  head  LATI	LONG   ALTI  SATC  HDOP  GSPD PIEZ
 				  stampDUM,
 				  tempDUM,
 				  humiDUM,
@@ -495,11 +449,12 @@ int main(void)
 				  gpsData.ggastruct.numofsat,
 				  gpsData.ggastruct.hdop,
 				  gpsData.rmcstruct.speed,
-				  piezDUM
+				  rc_pulse_width
 				  );
 
-		  uint8_t status = LoRa_transmit(&myLoRa, (uint8_t*)Buffer, strlen(Buffer), 2000);
-		  HAL_UART_Transmit(&huart2, (uint8_t*)Buffer, strlen(Buffer), HAL_MAX_DELAY);
+
+		  uint8_t status = LoRa_transmit(&myLoRa, (uint8_t*)Buffer, strlen(Buffer), 300);
+		  HAL_UART_Transmit(&huart2, (uint8_t*)Buffer, strlen(Buffer), 300);
 
 		  if(status == 1){
 			  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
@@ -569,12 +524,62 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    // Cek apakah ini dari TIM2 CH1
+    if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
+    {
+        if (rc_first_capture == 0)
+        {
+            // Rising edge (awal pulsa)
+            rc_ic_val1 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+            rc_first_capture = 1;
+
+            // Ubah ke falling edge untuk tangkap akhir pulsa
+            __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1,
+                                          TIM_INPUTCHANNELPOLARITY_FALLING);
+        }
+        else
+        {
+            // Falling edge detection
+            rc_ic_val2 = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+
+            if (rc_ic_val2 >= rc_ic_val1)
+            {
+                rc_pulse_width = rc_ic_val2 - rc_ic_val1;
+            }
+            else
+            {
+                // Timer overflow
+                uint32_t arr = __HAL_TIM_GET_AUTORELOAD(htim);
+                rc_pulse_width = (arr - rc_ic_val1) + rc_ic_val2 + 1;
+            }
+
+            // GPIO Control with Pulse Width
+            if (rc_pulse_width > RC_THRESHOLD_US)
+            {
+                HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_SET);   // ON
+            }
+            else
+            {
+                HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_RESET);   // OFF
+            }
+
+            // Balik lagi ke rising edge untuk siklus berikutnya
+            rc_first_capture = 0;
+            __HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_1,
+                                          TIM_INPUTCHANNELPOLARITY_RISING);
+        }
+    }
+}
+
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     // Timer yang dipakai untuk OneWire = TIM3
     if (htim->Instance == TIM3)
     {
-        ds18_tim_cb(htim);   // ini akan memanggil ow_callback(&ds18.ow);
+        ds18_tim_cb(htim);
     }
 }
 
